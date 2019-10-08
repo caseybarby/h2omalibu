@@ -1,0 +1,61 @@
+---
+title: "1_Yojoa_Site_Join"
+author: "Matthew Ross"
+date: "7/31/2019"
+output: html_document
+---
+
+# Lake Yojoa
+
+A cool place that has changed a lot in terms of water quality from 1984-2019.
+We are going to try to use AquaSat (see WRR paper one day). To do this
+we first need to join the yojoa data to the reflectance data (pulled by Simon Topp)
+
+```{r setup,include=F}
+library(feather)
+library(tidyverse)
+library(sf)
+library(mapview)
+library(lubridate)
+
+```
+
+## Read in raw datasets 
+
+```{r}
+situ <- read_csv('data/Yojoa (1).csv') %>%
+  mutate(date = mdy(Date)) %>%
+  rename(lat=Latitude,long=Longitude) %>%
+  mutate(situ_date=date) %>%
+  #Round so joins work gee sends down 8 million digits
+  mutate_at(vars(lat,long),round,digits=6)
+
+
+
+passes <- read_feather('data/Yojoa_dswe_mask.feather') %>%
+  rename(datetime=date) %>%
+  mutate(date=as.Date(datetime)) %>%
+  #Round so joins work, gee sends down 8 million digits
+  mutate_at(vars(lat,long),round,digits=6)
+
+
+
+
+sameday <- situ %>%
+  inner_join(passes,by=c('date','lat','long'))
+
+p1 <- situ %>%
+  mutate(date = date + 1) %>%
+  inner_join(passes,by=c('date','lat','long'))
+
+m1 <- situ %>%
+  mutate(date = date - 1) %>%
+  inner_join(passes,by=c('date','lat','long'))
+
+
+all <- rbind(sameday,p1,m1)
+
+write_csv(all,path='data/yojoa_matchups.csv')
+save(passes,all,situ,file='data/yojoa_all.RData')
+```
+

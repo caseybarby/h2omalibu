@@ -1,0 +1,324 @@
+---
+title: "2_yojoa_aquasat_where_you_at?"
+author: "Matthew Ross"
+date: "7/31/2019"
+output: html_document
+---
+
+
+## Yojoa-AquaSat where you at?
+
+In order to make predictions in Lake Yojoa (a relatively data poor lake), we
+want to use AquaSat (a dataset of 600,000 matchups) to train a machine learning
+algorithm. However, we need to first know, what lakes (in AquaSat) are most like 
+Yojoa. Here's an attempt at answering that question
+
+```{r include=F}
+
+library(feather)
+library(tidyverse)
+library(sf)
+library(mapview)
+library(lubridate)
+library(class)
+library(dissUtils)
+library(vegan)
+library(BART) #bayesian regression trees, propagate uncertainty
+load('data/yojoa_all.RData')
+
+## Subset yojoa to the most representative sites
+yojoa_representative <- passes %>%
+  #Keep sites Casey says represent lake color generally
+  filter(ID %in% c('B','F','E','P','R')) %>%
+  #drop factors
+  mutate(ID = as.character(ID)) %>%
+  filter(pixelCount > 9) %>%
+  #Drop sites with too much variation in swir (which should be low) 
+  filter(swir1_sd < 50) %>%
+  #remove cloudy images 
+  filter(Cloud_Cover < 50) %>%
+  #Add some band ratios from topp et al
+  mutate(br = blue/red,
+         gr= green/red,
+         bg= blue/green,
+         bn= blue/nir)
+
+# Additional filtering on the yojoa matchup data
+aq_yj <- all %>% 
+  #Match secchi  names
+  rename(secchi=Secchi) %>%
+  #Drop nas
+  filter(!is.na(secchi)) %>%
+  #Drop dupes
+  distinct(date,lat,long,.keep_all=T) %>%
+  filter(pixelCount > 9) %>% 
+  #Add ratios
+  mutate(br = blue/red,
+         gr= green/red,
+         bg= blue/green,
+         bn= blue/nir) %>%
+  #Same optical filtering as above
+  filter(swir1_sd < 50)  %>%
+  ungroup()
+
+
+
+#Load aquasat and do some filtering for nearest
+#neighbor matching to yojoa. 
+
+aq <- read_feather('data/wq_rs_join_v2.feather') %>%
+  #Keep only lakes
+  filter(type=='Lake') %>%
+  #Drop NAs
+  filter(!is.na(secchi)) %>%
+  # Keep sites with lots of pixels
+  filter(pixelCount > 50) %>%
+  # Keep sites that are generally called water by Pekel et al., 
+  filter(pwater > 90) %>%
+  # Set some sensibility thresholds in optical space
+  filter_at(vars(blue,green,red,nir,swir1,swir2),any_vars(.>0 & .<3000)) %>%
+  # Drop cloudy images
+  filter(clouds < 40) %>% 
+  #Same filters as above
+  filter(swir1_sd < 50) %>%
+  mutate(br = blue/red,
+         gr= green/red,
+         bg= blue/green,
+         bn= blue/nir) %>%
+  #Tropical match, tropics are hot, keep summer only.
+  filter(month(date) %in% c(6,7,8,9)) %>%
+  #Keep data that matches distribution in yojoa
+  filter(secchi > min(situ$Secchi,na.rm=T)-0.1 & secchi < max(situ$Secchi,na.rm=T)+0.1) 
+
+
+
+```
+
+## AquaSat similar site selection
+
+### Match sites by satellite
+
+Don't mess with this 
+```{r}
+
+#Nearest 3 neighbors within each satellite
+matcher <- function(a=yojoa_representative,b=aq,satellite=5){
+  a <- a %>%
+    filter(sat == satellite) %>%
+    select(red,blue,green,nir) %>%
+    as.matrix()
+  
+  b <- aq %>% 
+    filter(sat == satellite) %>%
+    select(red,blue,green,nir) %>%
+    as.matrix()
+  
+  distance <- diss(a,b)
+    neighbors <- neighbors(a,b,n.neighbors=3) 
+    neighbor.index <- neighbors.identify(neighbors,distance) %>% 
+    as.vector()
+
+
+  match <- aq[neighbor.index,] %>%
+    mutate(similarity = neighbors %>% as.vector())
+
+  return(match)
+}
+
+
+m5 <- matcher(satellite=5)
+m7 <- matcher(satellite = 7)
+m8 <- matcher(satellite = 8)
+
+
+
+#Set a minimum similarity score
+#Bind satellites
+good_sites <- rbind(m5,m7,m8) %>%
+  #Cluster by siteid
+  group_by(SiteID) %>%
+  # Get a count 
+  mutate(count=n()) %>%
+  #drop groups
+  ungroup() %>%
+  #sort by counts
+  arrange(count) %>%
+  filter(similarity < 250) %>% 
+  filter(swir1_sd < 50)
+
+
+
+```
+
+
+
+
+
+
+
+
+### Where are the most similar sites
+
+```{r}
+train <- good_sites %>%
+  filter(similarity < 20) %>%
+  filter(count > 2) 
+
+#Make a map of the matched sites
+site_map <-  train %>%
+  st_as_sf(.,coords=c('long','lat'),crs=4326) 
+
+mapview(site_map,zcol='count')
+```
+
+
+```{r}
+
+# TUNELANDIA. This can be played with a bunch and you should read about it
+#and play. 
+ag_mod <- wbart(x.train=train %>%
+                  dplyr::select(blue,green,red,nir,br,gr,bg,bn,zenith) %>% as.matrix(),
+                y.train = train %>% pull(secchi),
+                x.test = aq_yj %>% 
+                  select(blue,green,red,nir,br,gr,bg,bn,zenith) %>% as.matrix(),
+                cont=T,k=2,
+                ntree=200,numcut=20)
+
+#Tune ntree, k, numcut, bands that you use, etc...
+
+aq_yj$bpred <- ag_mod$yhat.test.mean
+
+
+error <- 
+  tibble(rmse=Metrics::rmse(aq_yj$bpred,aq_yj$secchi),
+                     mdae=Metrics::mdae(aq_yj$bpred,aq_yj$secchi),
+                     mape=Metrics::mape(aq_yj$bpred,aq_yj$secchi),
+                     bias=Metrics::bias(aq_yj$bpred,aq_yj$secchi))
+
+
+
+error
+
+ggplot(aq_yj,aes(x=secchi,y=bpred,color=year(date))) + 
+  geom_point() + 
+  geom_abline(intercept=0,slope=1) + 
+  stat_smooth(method='lm',color='blue')
+
+```
+
+## Raw yojoa vs bands
+
+```{r}
+ggplot(aq_yj,aes(x=br,y=secchi,color=month(date))) + 
+  geom_point() + 
+  stat_smooth(method='lm',color='blue')
+```
+
+
+```{r}
+
+
+
+mcmc_predict = predict(ag_mod,yojoa_representative %>% select(blue,green,red,nir,br,
+                                                          gr,bg,bn,zenith) %>%
+           as.matrix())
+
+means <- colMeans(mcmc_predict)
+
+medians <- apply(mcmc_predict,2,median)
+
+q95er <- function(x,y=0.95){quantile(x,y)}
+q95 <- apply(mcmc_predict,2,q95er)
+q5 <- apply(mcmc_predict,2,q95er,y=0.05)
+
+e <- yojoa_representative %>%
+  mutate(secchi = means,
+         s95 = q95,
+         s5 = q5)
+
+gp <- ggplot(e %>%
+               filter(ID == 'E'),aes(x=date,y=secchi,color=ID)) + 
+  geom_line()
+
+
+e.means <- e %>%
+  filter(ID == 'E') %>%
+  #filter(month(date) %in% c(1:5)) %>%
+  mutate(years=year(date)) %>%
+  group_by(years) %>%
+  summarize(secchi=median(secchi),
+            s95 = median(s95),
+            s5 = median(s5),
+            count=n()) %>%
+  filter(count > 2)
+
+
+# monthlies <- e %>%
+#   mutate(month=month(date),
+#          year=year(date)) %>%
+#   group_by(month,year) %>%
+#   summarize(secchi=mean(secchi))  %>%
+#   ungroup()
+# 
+# ggplot(monthlies,aes(x=month,y=secchi,color=year,group=year)) + 
+#   geom_line()
+
+situ_means <- situ %>%
+  filter(Location %in% c('Index','E','Basterrechea Index')) %>%
+  mutate(years=year(date)) %>%
+  group_by(years) %>%
+  summarize(secchi=mean(Secchi,na.rm=T),
+            count=n()) %>%
+  filter(count > 2) 
+
+str(e$datetime)
+ggplot(e,aes(x=date,y=secchi)) + 
+  geom_ribbon(aes(ymin=s5,ymax=s95),fill='gray',color=NA,alpha=0.5) + 
+  geom_point() +
+  geom_point(data=situ,aes(x=situ_date,y=Secchi),color='red')
+
+
+```
+
+## Yojoa self train
+
+Just for your comparison
+```{r}
+aq_yj$index <- 1:nrow(aq_yj)
+
+aq_train <- aq_yj %>%
+  sample_frac(0.5)
+
+aq_test <- aq_yj %>%
+  filter(!index %in% aq_train$index)
+
+
+ag_mod <- wbart(x.train=aq_train %>%
+                  dplyr::select(blue,green,red,nir,br,gr,bg,bn,zenith) %>% as.matrix(),
+                y.train = aq_train %>% pull(secchi),
+                x.test = aq_test %>% 
+                  select(blue,green,red,nir,br,gr,bg,bn,zenith) %>% as.matrix(),
+                cont=T,k=2,
+                ntree=200,numcut=20)
+
+aq_test$bpred <- ag_mod$yhat.test.mean
+
+
+error <- 
+  tibble(rmse=Metrics::rmse(aq_test$bpred,aq_test$secchi),
+                     mdae=Metrics::mdae(aq_test$bpred,aq_test$secchi),
+                     mape=Metrics::mape(aq_test$bpred,aq_test$secchi),
+                     bias=Metrics::bias(aq_test$bpred,aq_test$secchi))
+
+
+error
+
+ggplot(aq_test,aes(x=secchi,y=bpred,color=month(date))) + 
+  geom_point() + 
+  geom_abline(intercept=0,slope=1) + 
+  stat_smooth(method='lm',color='blue') + 
+  ggtitle('selftrain on yojoa only')
+
+
+
+```
